@@ -1,0 +1,335 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime, timedelta
+import bcrypt
+import jwt
+from bson import ObjectId
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# JWT Configuration
+SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+# Create the main app without a prefix
+app = FastAPI()
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+security = HTTPBearer()
+
+# Models
+class UserRegister(BaseModel):
+    username: str
+    password: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    username: str
+    user_id: str
+
+class User(BaseModel):
+    id: str
+    username: str
+    created_at: datetime
+
+class PostCreate(BaseModel):
+    content: str
+
+class Comment(BaseModel):
+    id: str
+    user_id: str
+    username: str
+    content: str
+    created_at: datetime
+
+class Post(BaseModel):
+    id: str
+    user_id: str
+    username: str
+    content: str
+    likes: List[str] = []  # List of user IDs who liked
+    like_count: int = 0
+    comments: List[Comment] = []
+    comment_count: int = 0
+    created_at: datetime
+
+class CommentCreate(BaseModel):
+    content: str
+
+# Helper functions
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        username: str = payload.get("username")
+        if user_id is None or username is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials"
+            )
+        return {"user_id": user_id, "username": username}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired"
+        )
+    except jwt.JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials"
+        )
+
+# Auth Routes
+@api_router.post("/auth/register", response_model=Token)
+async def register(user_data: UserRegister):
+    # Check if user already exists
+    existing_user = await db.users.find_one({"username": user_data.username})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already exists"
+        )
+    
+    # Create new user
+    hashed_pw = hash_password(user_data.password)
+    user_doc = {
+        "username": user_data.username,
+        "password": hashed_pw,
+        "created_at": datetime.utcnow()
+    }
+    result = await db.users.insert_one(user_doc)
+    user_id = str(result.inserted_id)
+    
+    # Create token
+    access_token = create_access_token(
+        data={"sub": user_id, "username": user_data.username}
+    )
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        username=user_data.username,
+        user_id=user_id
+    )
+
+@api_router.post("/auth/login", response_model=Token)
+async def login(user_data: UserLogin):
+    # Find user
+    user = await db.users.find_one({"username": user_data.username})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+    
+    # Verify password
+    if not verify_password(user_data.password, user["password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+    
+    # Create token
+    user_id = str(user["_id"])
+    access_token = create_access_token(
+        data={"sub": user_id, "username": user["username"]}
+    )
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        username=user["username"],
+        user_id=user_id
+    )
+
+@api_router.get("/auth/me", response_model=User)
+async def get_me(current_user: dict = Depends(get_current_user)):
+    user = await db.users.find_one({"_id": ObjectId(current_user["user_id"])})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return User(
+        id=str(user["_id"]),
+        username=user["username"],
+        created_at=user["created_at"]
+    )
+
+# Post Routes
+@api_router.post("/posts", response_model=Post)
+async def create_post(post_data: PostCreate, current_user: dict = Depends(get_current_user)):
+    post_doc = {
+        "user_id": current_user["user_id"],
+        "username": current_user["username"],
+        "content": post_data.content,
+        "likes": [],
+        "comments": [],
+        "created_at": datetime.utcnow()
+    }
+    result = await db.posts.insert_one(post_doc)
+    post_doc["_id"] = result.inserted_id
+    
+    return Post(
+        id=str(post_doc["_id"]),
+        user_id=post_doc["user_id"],
+        username=post_doc["username"],
+        content=post_doc["content"],
+        likes=post_doc["likes"],
+        like_count=len(post_doc["likes"]),
+        comments=post_doc["comments"],
+        comment_count=len(post_doc["comments"]),
+        created_at=post_doc["created_at"]
+    )
+
+@api_router.get("/posts", response_model=List[Post])
+async def get_posts():
+    posts = await db.posts.find().sort("created_at", -1).to_list(1000)
+    
+    result = []
+    for post in posts:
+        result.append(Post(
+            id=str(post["_id"]),
+            user_id=post["user_id"],
+            username=post["username"],
+            content=post["content"],
+            likes=post.get("likes", []),
+            like_count=len(post.get("likes", [])),
+            comments=post.get("comments", []),
+            comment_count=len(post.get("comments", [])),
+            created_at=post["created_at"]
+        ))
+    
+    return result
+
+@api_router.delete("/posts/{post_id}")
+async def delete_post(post_id: str, current_user: dict = Depends(get_current_user)):
+    post = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Post not found"
+        )
+    
+    # Check if user owns the post
+    if post["user_id"] != current_user["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own posts"
+        )
+    
+    await db.posts.delete_one({"_id": ObjectId(post_id)})
+    return {"message": "Post deleted successfully"}
+
+# Like Routes
+@api_router.post("/posts/{post_id}/like")
+async def toggle_like(post_id: str, current_user: dict = Depends(get_current_user)):
+    post = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Post not found"
+        )
+    
+    user_id = current_user["user_id"]
+    likes = post.get("likes", [])
+    
+    if user_id in likes:
+        # Unlike
+        likes.remove(user_id)
+        liked = False
+    else:
+        # Like
+        likes.append(user_id)
+        liked = True
+    
+    await db.posts.update_one(
+        {"_id": ObjectId(post_id)},
+        {"$set": {"likes": likes}}
+    )
+    
+    return {"liked": liked, "like_count": len(likes)}
+
+# Comment Routes
+@api_router.post("/posts/{post_id}/comment", response_model=Comment)
+async def add_comment(post_id: str, comment_data: CommentCreate, current_user: dict = Depends(get_current_user)):
+    post = await db.posts.find_one({"_id": ObjectId(post_id)})
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Post not found"
+        )
+    
+    comment = {
+        "id": str(ObjectId()),
+        "user_id": current_user["user_id"],
+        "username": current_user["username"],
+        "content": comment_data.content,
+        "created_at": datetime.utcnow()
+    }
+    
+    await db.posts.update_one(
+        {"_id": ObjectId(post_id)},
+        {"$push": {"comments": comment}}
+    )
+    
+    return Comment(**comment)
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
